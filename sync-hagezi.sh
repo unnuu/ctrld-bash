@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 1.6.4
-# Description: Syncs HaGeZi DNS blocklist folders to ControlD profiles.
-#              Features automatic backup/restore fallback for safe rule
-#              replacements. Pure Bash. No Python. TOML-driven configuration.
+# Version: 2.0.0
+# Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq
-# Platform: Linux, macOS, Termux (Android), GitHub Actions
 # =============================================================================
 
 set -o pipefail
 shopt -s extglob
 
-VERSION="1.6.4"
+VERSION="2.0.0"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -22,7 +19,6 @@ CONFIG_FILE="${CONFIG_FILE:-config.toml}"
 API_TOKEN="${CONTROLD_API_TOKEN:-}"
 API_BASE="https://api.controld.com"
 
-BATCH_SIZE=500
 API_RETRIES=3
 API_BACKOFF_BASE=2
 
@@ -101,7 +97,7 @@ api_call_with_retry() {
             sleep "$delay"
             delay=$((delay * 2))
         else
-            log "  ERROR: API call failed (HTTP $code)"
+            log "  ERROR: API call failed (HTTP $code) on $method $url"
             return 1
         fi
 
@@ -295,228 +291,6 @@ delete_group_by_pk() {
     api_call_with_retry "DELETE" "${API_BASE}/profiles/$1/groups/$2" >/dev/null
 }
 
-create_group() {
-    local pid="$1" name="$2" action_status="$3" action_do="${4:-0}"
-    local resp_body pk
-
-    [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would create group '$name' (do=$action_do)"; echo "DRYRUN"; return 0; }
-
-    local json_body
-    json_body=$(jq -n \
-        --arg name "$name" \
-        --argjson status "$action_status" \
-        --argjson do_val "$action_do" \
-        '{"name":$name,"action":{"do":$do_val,"status":$status}}') || {
-        log "  ERROR: Failed to build create_group JSON"
-        return 1
-    }
-
-    resp_body=$(api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups" "$json_body") || return 1
-
-    pk=$(jq -r '.body.groups[0].PK // .body.groups[0].id // .body.groups[0].pk // empty' 2>/dev/null <<< "$resp_body")
-    [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
-
-    pk=$(jq -r '.. | objects? | select(has("PK")) | .PK // empty' 2>/dev/null <<< "$resp_body" | head -n1)
-    [[ -n "$pk" && "$pk" != "null" ]] && { echo "$pk"; return 0; }
-
-    log "  WARN: Could not extract PK from create response"; return 1
-}
-
-add_all_rules() {
-    local pid="$1" group_id="$2" file="$3" total="$4"
-    local batch_num=0 added=0
-
-    [[ "$DRY_RUN" == true ]] && { log "  [DRY-RUN] Would add $total rules"; return 0; }
-    log "  Adding $total rules in batches of $BATCH_SIZE..."
-
-    local batches_file="$TMPDIR/batches_$$.jsonl"
-    jq -c --argjson bs "$BATCH_SIZE" --argjson gid "$group_id" '
-        .rules | group_by(.action.do, .action.status)[] |
-        {
-            do: .[0].action.do,
-            status: .[0].action.status,
-            hostnames: [.[].PK]
-        } | . as $g |
-        range(0; ($g.hostnames | length); $bs) |
-        {
-            do: $g.do,
-            status: $g.status,
-            group: $gid,
-            hostnames: $g.hostnames[.:.+$bs]
-        }
-    ' "$file" > "$batches_file"
-
-    local body
-    while IFS= read -r body; do
-        ((batch_num++))
-        local count do_val status_val
-        count=$(jq -r '.hostnames | length' <<< "$body")
-        do_val=$(jq -r '.do' <<< "$body")
-        status_val=$(jq -r '.status' <<< "$body")
-
-        api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/rules" "$body" >/dev/null || {
-            log "    ERROR: Batch $batch_num failed ($count rules, do=$do_val, status=$status_val)"
-            rm -f "$batches_file"
-            return 1
-        }
-        ((added += count))
-        log "    Batch $batch_num: $added/$total rules added (do=$do_val, status=$status_val, $count in this batch)"
-    done < "$batches_file"
-
-    rm -f "$batches_file"
-
-    log "  OK: All $total rules added in $batch_num batch(es)"
-    return 0
-}
-
-# ---------------------------------------------------------------------------
-# GROUP BACKUP / RESTORE (Fallback)
-# ---------------------------------------------------------------------------
-
-backup_group_rules() {
-    local pid="$1" group_pk="$2" output_file="$3" fallback_name="$4" source_file="$5"
-    local resp_body rules_count expected_count rules_json_file
-
-    expected_count=$(jq '.rules | length' "$source_file" 2>/dev/null || echo 0)
-
-    # Try API backup first
-    resp_body=$(api_call_with_retry "GET" "${API_BASE}/profiles/${pid}/rules/${group_pk}") || {
-        log "  WARN: Backup GET failed, using source fallback"
-        cp "$source_file" "$output_file"
-        log "  Backup OK (source fallback): $expected_count rules saved"
-        return 0
-    }
-
-    # Extract API rules to temp file
-    rules_json_file="$TMPDIR/backup_rules_$$.json"
-    jq '
-        if .body | type == "array" then .body
-        elif .body.rules | type == "array" then .body.rules
-        elif .data | type == "array" then .data
-        elif .data.rules | type == "array" then .data.rules
-        elif .rules | type == "array" then .rules
-        elif type == "array" then .
-        else empty end
-    ' <<< "$resp_body" > "$rules_json_file"
-
-    rules_count=$(jq 'length' "$rules_json_file" 2>/dev/null || echo 0)
-
-    # Try alternative endpoint if empty
-    if [[ "$rules_count" -eq 0 ]]; then
-        resp_body=$(api_call_with_retry "GET" "${API_BASE}/profiles/${pid}/rules?group=${group_pk}") || true
-        jq '
-            if .body | type == "array" then .body
-            elif .body.rules | type == "array" then .body.rules
-            elif .data | type == "array" then .data
-            elif .data.rules | type == "array" then .data.rules
-            elif .rules | type == "array" then .rules
-            elif type == "array" then .
-            else empty end
-        ' <<< "$resp_body" > "$rules_json_file"
-        rules_count=$(jq 'length' "$rules_json_file" 2>/dev/null || echo 0)
-    fi
-
-    # If API returned empty or fewer rules, merge with source JSON
-    if [[ "$rules_count" -eq 0 || "$rules_count" -lt "$expected_count" ]]; then
-        log "  WARN: API backup returned $rules_count/$expected_count rules, merging with source JSON"
-
-        # Build merged backup: API rules as base, source rules filling gaps
-        # Uses streaming input to avoid --slurpfile memory spike
-        jq -n --arg name "$fallback_name" '
-            (input // []) as $api_rules |
-            (input // {}) as $src |
-            ($src.rules // []) as $src_rules |
-            # Create a lookup of API rules by PK
-            ($api_rules | map({(.PK): .}) | add) as $api_lookup |
-            # Merge: prefer API rules (preserve actual ControlD state), fill missing from source
-            [
-                ($src_rules[] | $api_lookup[.PK] // .)
-            ] as $merged |
-            ($merged[0] // {}) as $first |
-            {
-                group: {
-                    group: $name,
-                    status: ($first.action.status // 1),
-                    action: {
-                        do: ($first.action.do // 0),
-                        status: ($first.action.status // 1)
-                    }
-                },
-                rules: [
-                    $merged[] | select(.PK != null) | {PK: .PK, action: .action}
-                ]
-            }
-        ' "$rules_json_file" "$source_file" > "$output_file" || {
-            log "  WARN: Merge jq failed, using pure source fallback"
-            rm -f "$rules_json_file"
-            cp "$source_file" "$output_file"
-            log "  Backup OK (source fallback): $expected_count rules saved"
-            return 0
-        }
-
-        local merged_count
-        merged_count=$(jq '.rules | length' "$output_file")
-        rm -f "$rules_json_file"
-        log "  Backup OK (merged): $merged_count rules saved ($rules_count from API + $(($merged_count - rules_count)) from source)"
-        return 0
-    fi
-
-    # API returned complete data, use it directly
-    jq --arg name "$fallback_name" '
-        (.[0] // {}) as $first |
-        {
-            group: {
-                group: $name,
-                status: ($first.action.status // 1),
-                action: {
-                    do: ($first.action.do // 0),
-                    status: ($first.action.status // 1)
-                }
-            },
-            rules: [
-                .[] | select(.PK != null) | {PK: .PK, action: .action}
-            ]
-        }
-    ' "$rules_json_file" > "$output_file" || {
-        log "  WARN: Backup jq failed, using source fallback"
-        rm -f "$rules_json_file"
-        cp "$source_file" "$output_file"
-        return 0
-    }
-
-    rm -f "$rules_json_file"
-    log "  Backup OK: $rules_count rules saved"
-    return 0
-}
-
-restore_group_from_backup() {
-    local pid="$1" backup_file="$2"
-    local name status_val total_rules group_id
-
-    [[ ! -f "$backup_file" ]] && { log "  ERROR: Backup file missing"; return 1; }
-
-    name=$(jq -r '.group.group' "$backup_file")
-    status_val=$(jq -r '.group.action.status // .group.status // 1' "$backup_file")
-    total_rules=$(jq '.rules | length' "$backup_file")
-
-    log "  Restoring group '$name' ($total_rules rules) from backup..."
-
-    group_id=$(create_group "$pid" "$name" "$status_val") || { log "  ERROR: Failed to recreate group"; return 1; }
-    [[ -z "$group_id" || "$group_id" == "null" ]] && { log "  ERROR: Got empty group ID during restore"; return 1; }
-
-    if [[ "$total_rules" -gt 0 ]]; then
-        add_all_rules "$pid" "$group_id" "$backup_file" "$total_rules" || {
-            log "  WARN: Group restored but rule re-injection failed, cleaning up..."
-            delete_group_by_pk "$pid" "$group_id" 2>/dev/null || true
-            return 1
-        }
-    fi
-
-    log "  OK: Group restored from backup (PK: $group_id)"
-    echo "$group_id"
-    return 0
-}
-
 # ---------------------------------------------------------------------------
 # TIME FORMATTING HELPERS
 # ---------------------------------------------------------------------------
@@ -581,22 +355,12 @@ hagezi_folder_epoch() {
 # HAGEZI GITHUB HELPERS
 # ---------------------------------------------------------------------------
 
-download_folder() {
-    [[ "$(curl -sL -o "$2" -w "%{http_code}" "$1")" == "200" ]] && jq empty "$2" 2>/dev/null && return 0
-    rm -f "$2"; return 1
-}
-
-# --- Smart download with cmp-based change detection ---
-# GitHub raw URLs (raw.githubusercontent.com) do NOT support If-Modified-Since
-# or ETag conditional requests. We download to temp and byte-compare against
-# persistent cache using cmp -s (POSIX, stops at first difference).
 download_folder_smart() {
     local url="$1" cachefile="$2" fname="$3"
     local persistent="$SYNC_CACHE/${fname// /_}.json"
     local tmpfile="$TMPDIR/${fname// /_}_dl.json"
     local code
 
-    # Download to temp first (GitHub raw doesn't support 304)
     code=$(curl -sL -o "$tmpfile" -w "%{http_code}" "$url")
 
     if [[ "$code" != "200" ]]; then
@@ -605,29 +369,25 @@ download_folder_smart() {
         return 1
     fi
 
-    # Validate JSON before we trust it
     if ! jq empty "$tmpfile" 2>/dev/null; then
         log "  ERROR: $fname: Invalid JSON received"
         rm -f "$tmpfile"
         return 1
     fi
 
-    # --no-cache: always treat as changed
     if [[ "$NO_CACHE" == true ]]; then
         log "  $fname: Cache disabled (--no-cache), treating as new."
         mv "$tmpfile" "$cachefile"
         return 0
     fi
 
-    # Compare with persistent cache from previous run
     if [[ -f "$persistent" ]] && cmp -s "$tmpfile" "$persistent"; then
         log "  $fname: Not modified (cmp), using cached copy."
         cp "$persistent" "$cachefile"
         rm -f "$tmpfile"
-        return 2  # Unchanged
+        return 2
     fi
 
-    # New or changed content: update both persistent and temp caches
     cp "$tmpfile" "$persistent"
     mv "$tmpfile" "$cachefile"
     return 0
@@ -754,7 +514,6 @@ profile_exists() {
     return 1
 }
 
-
 # ---------------------------------------------------------------------------
 # SUMMARY HELPER
 # ---------------------------------------------------------------------------
@@ -763,7 +522,6 @@ summary_row() {
     local profile="$1" folder="$2" status="$3" rules="$4"
     [[ -z "$SUMMARY_FILE" ]] && return
 
-    # Lazy header: write only when first row is about to be emitted
     if [[ ! -f "$TMPDIR/.summary_header_written" ]]; then
         echo "### ControlD HaGeZi Sync Report 🚀" >> "$SUMMARY_FILE"
         echo "| Profile | Folder | Status | Rules |" >> "$SUMMARY_FILE"
@@ -796,7 +554,6 @@ print_freshness_report() {
         lines+=("| $fname | $(format_relative_time "$seconds_diff" true) ($(format_iso_date "$date_str")) |")
     done
 
-    # GitHub Actions summary
     if [[ -n "$SUMMARY_FILE" ]]; then
         {
             echo ""
@@ -811,7 +568,6 @@ print_freshness_report() {
         return
     fi
 
-    # Terminal output
     log ""
     log "--- Upstream Freshness (GitHub) ---"
     for fname in "${!HAGEZI_FOLDERS[@]}"; do
@@ -828,30 +584,13 @@ print_freshness_report() {
 }
 
 # ---------------------------------------------------------------------------
-# RESTORE HELPER
-# ---------------------------------------------------------------------------
-
-attempt_restore() {
-    local pid="$1" backup_file="$2"
-    local restored_id
-    log "  Attempting restore from backup..."
-    restored_id=$(restore_group_from_backup "$pid" "$backup_file")
-    if [[ $? -eq 0 && -n "$restored_id" && "$restored_id" != "null" ]]; then
-        log "  OK: Fallback restore complete (PK: $restored_id)"
-        return 0
-    else
-        log "  ERROR: Fallback restore also failed"
-        return 1
-    fi
-}
-
-# ---------------------------------------------------------------------------
-# SYNC WITH BACKUP/RESTORE FALLBACK
+# SERVER-SIDE ATOMIC SYNC LOGIC
 # ---------------------------------------------------------------------------
 
 sync_folder() {
     local pname="$1" pid="$2" fname="$3" cachefile="$4" groups_json="$5"
-    local existing_pk group_id backup_file name total_rules action_status restored_id action_do
+    local existing_pk name old_name total_rules import_payload new_pk
+
     log "  Folder: $fname"
 
     [[ ! -f "$cachefile" ]] && {
@@ -862,63 +601,82 @@ sync_folder() {
 
     name=$(jq -r '.group.group' "$cachefile")
     total_rules=$(jq '.rules | length' "$cachefile")
+    old_name="${name}_OLD"
 
     existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
 
-    # --- BACKUP EXISTING GROUP BEFORE TOUCHING ANYTHING ---
+    # --- Step 1: Rename existing to _OLD ---
     if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
-        backup_file="$TMPDIR/backup_${existing_pk}.json"
-        if backup_group_rules "$pid" "$existing_pk" "$backup_file" "$name" "$cachefile"; then
-            local backup_count
-            backup_count=$(jq '.rules | length' "$backup_file" 2>/dev/null || echo 0)
-            if [[ "$backup_count" -eq 0 ]]; then
-                log "  WARN: Backup has 0 rules (API read-after-write inconsistency?)"
-                summary_row "$pname" "$fname" "⚠️ Backup empty (0 rules)" "-"
-            else
-                log "  Backup ready: $backup_file"
+        log "  Renaming existing group to '$old_name'..."
+        if [[ "$DRY_RUN" == false ]]; then
+            local rename_payload
+            rename_payload=$(jq -n --arg n "$old_name" '{"name": $n}')
+            if ! api_call_with_retry "PUT" "${API_BASE}/profiles/${pid}/groups/${existing_pk}" "$rename_payload" >/dev/null; then
+                log "  ERROR: Failed to rename existing group. Aborting."
+                summary_row "$pname" "$fname" "❌ Rename Failed" "-"
+                return 1
             fi
-        else
-            log "  WARN: Backup failed, proceeding without fallback"
-            backup_file=""
         fi
     fi
-    # -------------------------------------------------------
 
-    # Delete old group
-    if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
-        log "  Deleting old '$name' (PK: $existing_pk)..."
-        delete_group_by_pk "$pid" "$existing_pk" || log "  WARN: Delete returned non-2xx"
+    # --- Step 2: Import new definition ---
+    import_payload=$(jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile")
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "  [DRY-RUN] Would import '$name' ($total_rules rules) and delete '$old_name'"
+        summary_row "$pname" "$fname" "✅ Success (Dry Run)" "$total_rules"
+        return 0
     fi
 
-    # Create new group
-    action_status=$(jq -r '.group.action.status // .group.status // .rules[0].action.status // 1' "$cachefile")
-    action_do=$(jq -r '.group.action.do // .rules[0].action.do // 0' "$cachefile")
-    group_id=$(create_group "$pid" "$name" "$action_status" "$action_do")
-    if [[ $? -ne 0 || -z "$group_id" || "$group_id" == "null" ]]; then
-        log "  ERROR: Group creation failed"
-        [[ -n "$backup_file" && -f "$backup_file" ]] && attempt_restore "$pid" "$backup_file"
-        summary_row "$pname" "$fname" "❌ Create failed" "-"
-        return 1
-    fi
+    log "  Importing $total_rules rules as '$name'..."
+    if api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups/import" "$import_payload" >/dev/null; then
+        # --- Step 3a: Success — find new PK and delete old ---
+        # Refresh groups to find the newly imported PK
+        local refreshed_groups
+        refreshed_groups=$(get_profile_groups "$pid") || true
+        new_pk=$(find_group_pk_by_name "$refreshed_groups" "$name")
 
-    log "  Group created (ID: $group_id)"
-
-    # Inject rules
-    if add_all_rules "$pid" "$group_id" "$cachefile" "$total_rules"; then
-        log "  OK: Folder synced"
-        [[ -n "$backup_file" && -f "$backup_file" ]] && rm -f "$backup_file"
+        if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
+            log "  Cleaning up old group..."
+            delete_group_by_pk "$pid" "$existing_pk"
+        fi
         summary_row "$pname" "$fname" "✅ Success" "$total_rules"
         return 0
     else
-        log "  WARN: Group created but rules failed, attempting restore..."
-        if [[ "$DRY_RUN" != true ]]; then
-            delete_group_by_pk "$pid" "$group_id" 2>/dev/null || true
+        # --- Step 3b: Failure — rollback ---
+        log "  ERROR: Import failed. Attempting rollback..."
+        
+        # First, try to delete any partially-created new group
+        local refreshed_groups
+        refreshed_groups=$(get_profile_groups "$pid") || true
+        new_pk=$(find_group_pk_by_name "$refreshed_groups" "$name")
+        
+        if [[ -n "$new_pk" && "$new_pk" != "null" ]]; then
+            log "  Deleting partially-imported group..."
+            delete_group_by_pk "$pid" "$new_pk" 2>/dev/null || true
         fi
-        [[ -n "$backup_file" && -f "$backup_file" ]] && attempt_restore "$pid" "$backup_file"
-        summary_row "$pname" "$fname" "❌ Rules failed" "-"
+
+        # Then rename _OLD back to original
+        if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
+            local rollback_payload
+            rollback_payload=$(jq -n --arg n "$name" '{"name": $n}')
+            if api_call_with_retry "PUT" "${API_BASE}/profiles/${pid}/groups/${existing_pk}" "$rollback_payload" >/dev/null; then
+                log "  Rollback complete. Restored original group."
+            else
+                log "  CRITICAL ERROR: Rollback failed. Group is stuck as '$old_name'."
+                summary_row "$pname" "$fname" "❌ CRITICAL: Rollback failed" "-"
+                return 1
+            fi
+        fi
+
+        summary_row "$pname" "$fname" "❌ Import failed (rolled back)" "-"
         return 1
     fi
 }
+
+# ---------------------------------------------------------------------------
+# MAIN EXECUTION
+# ---------------------------------------------------------------------------
 
 main() {
     parse_args "$@"
@@ -940,18 +698,15 @@ main() {
 
     [[ -z "$API_TOKEN" ]] && { log "ERROR: API token required."; exit 1; }
 
-    # --- GitHub Actions setup (single place) ---
     if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
         echo "::add-mask::$API_TOKEN"
         [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
     fi
 
-    # Initialize temp directory
     TMPDIR=$(mktemp -d)
     trap '[[ -n "${TMPDIR:-}" ]] && rm -rf "$TMPDIR"' EXIT
     mkdir -p "$TMPDIR/cache"
 
-    # Cache setup
     mkdir -p "$SYNC_CACHE"
     if [[ -f "$SYNC_CACHE/.version" && "$(cat "$SYNC_CACHE/.version")" != "$CACHE_VERSION" ]]; then
         log "Cache format changed (v$(cat "$SYNC_CACHE/.version") -> v$CACHE_VERSION), clearing old cache..."
@@ -965,7 +720,6 @@ main() {
     [[ "$NO_CACHE" == true ]] && log "MODE: NO-CACHE"
     log "========================================"
 
-    # --- Download phase ---
     log "Pre-downloading HaGeZi folder data..."
     local fname cachefile dl_status
     local -i skipped=0 downloaded=0 failed=0
@@ -991,7 +745,6 @@ main() {
 
     log "Download complete: $downloaded new, $skipped unchanged, $failed failed"
 
-    # --- Check-updates mode: exit early, no ControlD API calls ---
     if [[ "$CHECK_UPDATES" == true ]]; then
         if [[ "$downloaded" -gt 0 ]]; then
             log "UPDATES AVAILABLE: $downloaded folder(s) changed upstream"
@@ -1005,7 +758,6 @@ main() {
     local ALL_PROFILES
     ALL_PROFILES=$(get_all_profiles) || exit
 
-    # --- Early exit if nothing changed ---
     if [[ "$downloaded" -eq 0 && "$failed" -eq 0 ]]; then
         log "All folders unchanged upstream. Nothing to sync."
         log "========================================"
@@ -1015,7 +767,6 @@ main() {
         exit 0
     fi
 
-    # --- Sync phase ---
     local pname pid
     for pname in "${PROFILE_NAMES[@]}"; do
         [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]] && continue
