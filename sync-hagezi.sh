@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # ControlD HaGeZi Folder Auto-Sync
-# Version: 2.1.1
+# Version: 2.1.2
 # Description: Syncs HaGeZi DNS blocklist folders using atomic server-side swaps.
 # Requirements: bash 4.3+, curl, jq
 # =============================================================================
@@ -9,7 +9,7 @@
 set -o pipefail
 shopt -s extglob
 
-VERSION="2.1.1"
+VERSION="2.1.2"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -64,7 +64,15 @@ api_call_with_retry() {
     local code body retry_after
     local curl_opts=("--request" "$method" "--url" "$url" "--header" "Authorization: Bearer ${API_TOKEN}")
 
-    [[ -n "$data" ]] && curl_opts+=("--header" "content-type: application/json" "--data" "$data")
+    if [[ -n "$data" ]]; then
+        if [[ "$data" == @* ]]; then
+            # File pointer payload (bypasses ARG_MAX)
+            curl_opts+=("--header" "content-type: application/json" "--data-binary" "$data")
+        else
+            # Standard string payload
+            curl_opts+=("--header" "content-type: application/json" "--data" "$data")
+        fi
+    fi
 
     if [[ -z "$API_BODY_FILE" ]]; then
         API_BODY_FILE="$WORK_DIR/api_body_$$"
@@ -623,19 +631,20 @@ rollback_group() {
 
 import_with_validation() {
     local pid="$1" name="$2" cachefile="$3" fname="$4"
-    local import_payload new_pk refreshed_groups
+    local import_payload_file new_pk refreshed_groups
     local total_rules persistent
     local attempt=0 max_attempts=2
 
+    import_payload_file="$WORK_DIR/import_${pid}_$$.json"
     total_rules=$(jq '.rules | length' "$cachefile")
-    import_payload=$(jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile")
+    jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile" > "$import_payload_file"
 
     while (( attempt < max_attempts )); do
         attempt=$(( attempt + 1 ))
         [[ "$attempt" -gt 1 ]] && log "  Retry attempt $attempt/$max_attempts..."
 
         log "  Importing $total_rules rules as '$name'..."
-        if ! api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups/import" "$import_payload" >/dev/null; then
+        if ! api_call_with_retry "POST" "${API_BASE}/profiles/${pid}/groups/import" "@$import_payload_file" >/dev/null; then
             log "  ERROR: Import failed on attempt $attempt"
             break
         fi
@@ -658,6 +667,7 @@ import_with_validation() {
                     if [[ "$actual_count" -eq "$total_rules" ]]; then
                         log "  New group imported with PK: $new_pk"
                         log "  Validation passed: $actual_count/$total_rules rules match (${poll_count}s)"
+                        rm -f "$import_payload_file"
                         echo "$new_pk"
                         return 0
                     else
@@ -687,9 +697,10 @@ import_with_validation() {
         fi
 
         total_rules=$(jq '.rules | length' "$cachefile")
-        import_payload=$(jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile")
+        jq -c --arg n "$name" '{config: (. | .group.group = $n)}' "$cachefile" > "$import_payload_file"
     done
 
+    rm -f "$import_payload_file"
     return 1
 }
 
@@ -904,11 +915,11 @@ main() {
                 status=$?
                 if [[ "$status" -eq 0 ]]; then
                     SUCCESS_COUNT=$(( SUCCESS_COUNT + 1 ))
-                    # State was modified, refresh the JSON for next folder
-                    current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to refresh profile groups"; continue; }
                 else
                     FAILED_COUNT=$(( FAILED_COUNT + 1 ))
                 fi
+                # ALWAYS refresh state — sync_folder may have mutated it even on failure
+                current_groups_json=$(get_profile_groups "$pid") || { log "  ERROR: Failed to refresh profile groups"; continue; }
             fi
         done
     done
