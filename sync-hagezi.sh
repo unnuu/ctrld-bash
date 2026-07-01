@@ -199,7 +199,7 @@ parse_toml_array() {
         [[ "$in_quotes" -eq 1 ]] && buf+="$ch"
     done
 
-    local IFS="|"
+    local IFS=$'\x1F'
     echo "${items[*]}"
 }
 
@@ -207,7 +207,7 @@ toml_get() { echo "${_TOML_VALS["$1|$2"]:-}"; }
 
 toml_get_array() {
     local raw="${_TOML_VALS["$1|$2"]:-}"
-    [[ -n "$raw" ]] && tr '|' '\n' <<< "$raw"
+    [[ -n "$raw" ]] && tr $'\x1F' '\n' <<< "$raw"
 }
 
 load_config() {
@@ -714,6 +714,14 @@ sync_folder() {
 
     existing_pk=$(find_group_pk_by_name "$groups_json" "$name")
 
+    # Check for stale _OLD group from a previous aborted run
+    local stale_old_pk
+    stale_old_pk=$(find_group_pk_by_name "$groups_json" "$old_name")
+    if [[ -n "$stale_old_pk" && "$stale_old_pk" != "null" ]]; then
+        log "  Found stale '$old_name' from previous run, cleaning up..."
+        delete_group_by_pk "$pid" "$stale_old_pk" 2>/dev/null || true
+    fi
+
     # Step 1: Rename existing to _OLD
     if [[ -n "$existing_pk" && "$existing_pk" != "null" ]]; then
         log "  Renaming existing group to '$old_name'..."
@@ -843,15 +851,6 @@ main() {
 
     ALL_PROFILES=$(get_all_profiles) || exit
 
-    if [[ "$downloaded" -eq 0 && "$failed" -eq 0 ]]; then
-        log "All folders unchanged upstream. Nothing to sync."
-        log "========================================"
-        log "Sync Complete: 0 changes needed"
-        log "========================================"
-        print_freshness_report
-        exit 0
-    fi
-
     for pname in "${PROFILE_NAMES[@]}"; do
         [[ -n "$TARGET_PROFILE" && "$pname" != "$TARGET_PROFILE" ]] && continue
 
@@ -864,7 +863,7 @@ main() {
         folder_list="${PROFILE_FOLDERS[$pname]}"
         [[ -z "$folder_list" ]] && { log "  WARN: No folders mapped"; continue; }
 
-        IFS='|' read -ra TO_SYNC <<< "$folder_list"
+        IFS=$'\x1F' read -ra TO_SYNC <<< "$folder_list"
         for f in "${TO_SYNC[@]}"; do
             local cachefile="$WORK_DIR/cache/${f// /_}.json"
             local needs_sync=false
